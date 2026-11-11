@@ -1,0 +1,82 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Jenkins internals (JVM, executors, queue, builds) from the Prometheus plugin
+  - job_name: jenkins
+    metrics_path: /prometheus/
+    static_configs:
+      - targets: ["jenkins:8080"]
+
+  # Container CPU / memory
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  - job_name: blackbox
+    static_configs:
+      - targets: ["blackbox:9115"]
+
+  # Edge traffic: requests by status code, latency, open connections
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8082"]
+
+  # ---------------------------------------------------------------- Probes
+  # LIVENESS: TCP connect to the Jenkins web port
+  - job_name: probe-liveness
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets: ["jenkins:8080"]
+        labels:
+          probe: liveness
+    relabel_configs: &blackbox_relabel
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # READINESS: login page returns 200 (503 while Jenkins is still loading)
+  - job_name: probe-readiness
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ["http://jenkins:8080/login"]
+        labels:
+          probe: readiness
+    relabel_configs: *blackbox_relabel
+
+  # STARTUP: metrics endpoint only answers once plugins have fully loaded
+  - job_name: probe-startup
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ["http://jenkins:8080/prometheus/"]
+        labels:
+          probe: startup
+    relabel_configs: *blackbox_relabel
+
+  # EDGE: what a real user sees — through Traefik and all its protections
+  - job_name: probe-edge
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ["http://traefik/login"]
+        labels:
+          probe: edge
+    relabel_configs: *blackbox_relabel

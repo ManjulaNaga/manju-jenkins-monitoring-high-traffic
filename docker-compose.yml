@@ -1,0 +1,242 @@
+name: jenkins-setup
+
+services:
+  # ===================================================================
+  # EDGE: Traefik reverse proxy — the only way in for users/webhooks.
+  # Protects Jenkins with rate limiting, a concurrency cap, a circuit
+  # breaker, retries, health-based routing and a maintenance page.
+  # ===================================================================
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=ci-net
+      - --entrypoints.web.address=:80
+      # Slow clients can't hold connections forever
+      - --entrypoints.web.transport.respondingTimeouts.readTimeout=60s
+      - --entrypoints.web.transport.respondingTimeouts.writeTimeout=120s
+      - --entrypoints.web.transport.respondingTimeouts.idleTimeout=180s
+      # Graceful shutdown: finish in-flight requests for up to 30s
+      - --entrypoints.web.transport.lifeCycle.graceTimeOut=30s
+      # Prometheus metrics on a separate internal port
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entryPoint=metrics
+      - --metrics.prometheus.addServicesLabels=true
+      - --metrics.prometheus.addEntryPointsLabels=true
+      - --metrics.prometheus.buckets=0.05,0.1,0.25,0.5,1,2.5,5,10
+      - --ping=true
+      - --api.dashboard=true
+      - --api.insecure=true          # Traefik dashboard on :8088 (local use only)
+      - --entrypoints.traefik.address=:8088
+      - --accesslog=true
+    ports:
+      - "80:80"                      # Jenkins (through the protections)
+      - "127.0.0.1:8088:8088"        # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 256m }
+    networks: [ci]
+
+  # Friendly page shown while Jenkins is starting, restarting or overloaded
+  maintenance:
+    image: nginx:1.27-alpine
+    container_name: maintenance
+    restart: unless-stopped
+    volumes:
+      - ./maintenance:/usr/share/nginx/html:ro
+    labels:
+      - traefik.enable=true
+      - traefik.http.services.maintenance.loadbalancer.server.port=80
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 32m }
+    networks: [ci]
+
+  # ===================================================================
+  # Jenkins controller — schedules work; builds run on on-demand agents
+  # ===================================================================
+  jenkins:
+    build: .
+    container_name: jenkins
+    restart: unless-stopped
+    group_add:
+      - "${DOCKER_GID:-0}"           # group owning docker.sock (0 on Docker Desktop)
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock   # used to start build agents
+      - ./jenkins.yaml:/var/jenkins_conf/jenkins.yaml:ro
+    environment:
+      - CASC_JENKINS_CONFIG=/var/jenkins_conf/jenkins.yaml
+      # - G1 GC + heap sized from the container limit
+      # - NodeProvisioner tuning: start agents as soon as work is queued
+      - >-
+        JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+        -XX:MaxRAMPercentage=75 -XX:+UseG1GC -XX:+UseStringDeduplication
+        -Dhudson.slaves.NodeProvisioner.initialDelay=0
+        -Dhudson.slaves.NodeProvisioner.MARGIN=50
+        -Dhudson.slaves.NodeProvisioner.MARGIN0=0.85
+      - JENKINS_ADMIN_USER=${JENKINS_ADMIN_USER:-admin}
+      - JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD:?JENKINS_ADMIN_PASSWORD must be set}
+      - GIT_USER=${GIT_USER}
+      - GIT_TOKEN=${GIT_TOKEN:?GIT_TOKEN must be set}
+      - AGENT_MAX=${AGENT_MAX:-10}
+      - JENKINS_URL=${JENKINS_URL:-http://localhost/}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jenkins.rule=PathPrefix(`/`)
+      - traefik.http.routers.jenkins.entrypoints=web
+      - traefik.http.routers.jenkins.middlewares=jenkins-errors,jenkins-ratelimit,jenkins-inflight,jenkins-cb,jenkins-retry
+      - traefik.http.services.jenkins.loadbalancer.server.port=8080
+      # Health-based routing: stop sending traffic when /login fails
+      - traefik.http.services.jenkins.loadbalancer.healthcheck.path=/login
+      - traefik.http.services.jenkins.loadbalancer.healthcheck.interval=10s
+      - traefik.http.services.jenkins.loadbalancer.healthcheck.timeout=3s
+      # 1) Show maintenance page instead of raw 502/503/504
+      - traefik.http.middlewares.jenkins-errors.errors.status=502-504
+      - traefik.http.middlewares.jenkins-errors.errors.service=maintenance
+      - traefik.http.middlewares.jenkins-errors.errors.query=/index.html
+      # 2) Per-client rate limit -> HTTP 429 instead of overload
+      - traefik.http.middlewares.jenkins-ratelimit.ratelimit.average=${RATE_LIMIT_AVG:-50}
+      - traefik.http.middlewares.jenkins-ratelimit.ratelimit.burst=${RATE_LIMIT_BURST:-100}
+      # 3) Cap concurrent requests reaching Jenkins
+      - traefik.http.middlewares.jenkins-inflight.inflightreq.amount=${MAX_INFLIGHT:-100}
+      # 4) Circuit breaker: back off when Jenkins is failing, recover gradually
+      - traefik.http.middlewares.jenkins-cb.circuitbreaker.expression=NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.50
+      - traefik.http.middlewares.jenkins-cb.circuitbreaker.fallbackDuration=10s
+      - traefik.http.middlewares.jenkins-cb.circuitbreaker.recoveryDuration=20s
+      # 5) Retry transient network errors (not HTTP errors)
+      - traefik.http.middlewares.jenkins-retry.retry.attempts=2
+      - traefik.http.middlewares.jenkins-retry.retry.initialInterval=200ms
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 3g }
+    stop_grace_period: 120s          # let Jenkins save state before SIGKILL
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/login || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    networks: [ci]
+
+  # ===================================================================
+  # Monitoring
+  # ===================================================================
+  blackbox:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: blackbox
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64m }
+    networks: [ci]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    command: ["--docker_only=true", "--housekeeping_interval=15s"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+    networks: [ci]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on: [blackbox, cadvisor]
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1g }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [ci]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/jenkins-health.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512m }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [ci]
+
+  # ===================================================================
+  # Load test (not started by default):
+  #   docker compose --profile loadtest run --rm k6
+  # ===================================================================
+  k6:
+    image: grafana/k6:0.52.0
+    profiles: [loadtest]
+    command: ["run", "/scripts/http-load.js"]
+    environment:
+      - TARGET=http://traefik
+    volumes:
+      - ./loadtest:/scripts:ro
+    networks: [ci]
+
+networks:
+  ci:
+    name: ci-net
+
+volumes:
+  jenkins_data:
+  prometheus_data:
+  grafana_data:

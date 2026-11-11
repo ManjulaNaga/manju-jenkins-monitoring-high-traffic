@@ -1,0 +1,17 @@
+modules:
+  # Liveness: is the process accepting connections at all?
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+
+  # Readiness / startup: does the endpoint answer with HTTP 2xx?
+  # (Jenkins returns 503 "Jenkins is getting ready to work" while booting)
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      follow_redirects: true

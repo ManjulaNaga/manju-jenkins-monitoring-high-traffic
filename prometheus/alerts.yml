@@ -1,0 +1,110 @@
+groups:
+  - name: jenkins-probes
+    rules:
+      - alert: JenkinsLivenessFailed
+        expr: probe_success{probe="liveness", instance="jenkins:8080"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Jenkins is not accepting connections"
+          description: "TCP probe to {{ $labels.instance }} has failed for 1 minute."
+
+      - alert: JenkinsNotReady
+        expr: probe_success{probe="readiness"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Jenkins is up but not ready"
+          description: "/login has not returned HTTP 2xx for 2 minutes."
+
+      - alert: JenkinsStartupTooSlow
+        expr: probe_success{probe="startup"} == 0 and on() (time() - max(container_start_time_seconds{container_label_com_docker_compose_service="jenkins"})) > 300
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Jenkins has not finished starting after 5 minutes"
+
+      - alert: JenkinsScrapeDown
+        expr: up{job="jenkins"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Prometheus cannot scrape Jenkins metrics"
+
+  - name: jenkins-resources
+    rules:
+      - alert: JenkinsHighCPU
+        expr: |
+          sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service="jenkins"}[2m]))
+            / max(container_spec_cpu_quota{container_label_com_docker_compose_service="jenkins"}
+                  / container_spec_cpu_period{container_label_com_docker_compose_service="jenkins"}) * 100 > 80
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Jenkins CPU above 80% of its limit for 5 minutes"
+
+      - alert: JenkinsHighMemory
+        expr: |
+          max(container_memory_working_set_bytes{container_label_com_docker_compose_service="jenkins"})
+            / max(container_spec_memory_limit_bytes{container_label_com_docker_compose_service="jenkins"}) * 100 > 90
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Jenkins memory above 90% of its limit for 5 minutes"
+
+      - alert: JenkinsHeapHigh
+        expr: vm_memory_heap_usage{job="jenkins"} > 0.9
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Jenkins JVM heap above 90%"
+
+  - name: traffic
+    rules:
+      - alert: JenkinsBackendUnhealthy
+        expr: max(traefik_service_server_up{service="jenkins@docker"}) == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Traefik has no healthy Jenkins backend (users see the maintenance page)"
+
+      - alert: HighServerErrorRate
+        expr: |
+          sum(rate(traefik_service_requests_total{service="jenkins@docker", code=~"5.."}[5m]))
+            / sum(rate(traefik_service_requests_total{service="jenkins@docker"}[5m])) * 100 > 5
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "More than 5% of Jenkins requests are failing with 5xx"
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(traefik_service_request_duration_seconds_bucket{service="jenkins@docker"}[5m]))) > 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "95% of Jenkins requests are slower than 2s"
+
+      - alert: RateLimitingActive
+        expr: sum(rate(traefik_service_requests_total{service="jenkins@docker", code="429"}[5m])) > 1
+        for: 5m
+        labels: { severity: info }
+        annotations:
+          summary: "Clients are being rate limited (429) — traffic above configured limits"
+
+  - name: build-capacity
+    rules:
+      - alert: BuildQueueBacklog
+        expr: sum(default_jenkins_queue_size_value) > 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 10 builds have been waiting for 10 minutes"
+
+      - alert: AgentCapacityExhausted
+        expr: count(container_memory_working_set_bytes{image=~"jenkins/agent.*"}) >= 10 and on() sum(default_jenkins_queue_size_value) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "All build agents are in use and builds are queuing — consider raising AGENT_MAX"

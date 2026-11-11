@@ -1,0 +1,143 @@
+jenkins:
+  systemMessage: "Jenkins configured by Configuration as Code"
+  # The controller only schedules; all builds run on on-demand Docker agents.
+  numExecutors: 0
+  quietPeriod: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_USER}"
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+  # ---- Elastic build capacity -------------------------------------
+  # Jenkins starts a fresh agent container for each queued build (up to
+  # AGENT_MAX at once) and removes it after 1 idle minute.
+  clouds:
+    - docker:
+        name: "docker"
+        containerCap: "${AGENT_MAX:-10}"
+        dockerApi:
+          dockerHost:
+            uri: "unix:///var/run/docker.sock"
+        templates:
+          - labelString: "docker-agent"
+            dockerTemplateBase:
+              image: "jenkins/agent:jdk21"
+            remoteFs: "/home/jenkins/agent"
+            connector:
+              attach:
+                user: "jenkins"
+            instanceCapStr: "${AGENT_MAX:-10}"
+            retentionStrategy:
+              idleMinutes: 1
+
+unclassified:
+  location:
+    url: "${JENKINS_URL:-http://localhost/}"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "git-creds"
+              username: "${GIT_USER}"
+              password: "${GIT_TOKEN}"
+
+jobs:
+  - script: |
+      // ------------------------------------------------ sample-job
+      pipelineJob('sample-job') {
+        description('Sample pipeline running on an on-demand Docker agent')
+        definition {
+          cps {
+            sandbox()
+            script('''
+              pipeline {
+                agent { label 'docker-agent' }
+                options {
+                  timeout(time: 10, unit: 'MINUTES')
+                  buildDiscarder(logRotator(numToKeepStr: '20'))
+                }
+                stages {
+                  stage('Hello') {
+                    steps {
+                      echo 'Hello from Jenkins!'
+                      sh 'echo "Build $BUILD_NUMBER on $NODE_NAME"'
+                    }
+                  }
+                }
+              }
+            ''')
+          }
+        }
+      }
+      queue('sample-job')
+
+      // ------------------------------------------------ workload
+      // A simulated build (20-60s of work). Many run in parallel.
+      pipelineJob('workload') {
+        description('Simulated build used by load-generator')
+        parameters {
+          stringParam('ID', '0', 'Request id (keeps queued builds distinct)')
+        }
+        definition {
+          cps {
+            sandbox()
+            script('''
+              pipeline {
+                agent { label 'docker-agent' }
+                options {
+                  timeout(time: 5, unit: 'MINUTES')
+                  buildDiscarder(logRotator(numToKeepStr: '50'))
+                }
+                stages {
+                  stage('Work') {
+                    steps {
+                      sh 'echo "request $ID on $NODE_NAME"; sleep $(shuf -i 20-60 -n 1)'
+                    }
+                  }
+                }
+              }
+            ''')
+          }
+        }
+      }
+
+      // ------------------------------------------------ load-generator
+      // Queues COUNT workload builds at once to simulate a traffic spike.
+      pipelineJob('load-generator') {
+        description('Simulate a burst of builds. Watch agents scale in Grafana.')
+        parameters {
+          stringParam('COUNT', '20', 'How many workload builds to queue')
+        }
+        definition {
+          cps {
+            sandbox()
+            script('''
+              pipeline {
+                agent none
+                stages {
+                  stage('Queue builds') {
+                    steps {
+                      script {
+                        int n = Integer.parseInt(params.COUNT)
+                        for (int i = 1; i <= n; i++) {
+                          build job: 'workload', wait: false,
+                                parameters: [string(name: 'ID', value: String.valueOf(i))]
+                        }
+                        echo "Queued " + n + " workload builds"
+                      }
+                    }
+                  }
+                }
+              }
+            ''')
+          }
+        }
+      }
